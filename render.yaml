@@ -7,24 +7,19 @@ services:
     envVars:
       - key: PATRIABOT_URL
         value: https://patria-stream-bot.disetoal.workers.dev
-
       - key: TIKTOK_BRIDGE_TOKEN
         sync: false
-
+      - key: DISCORD_BOT_TOKEN
+        sync: false
       - key: DEPLOYMENT_LABEL
         value: render
-
       - key: HOST_LABEL
         value: Render
-
       - key: POLL_SECONDS
         value: "60"
-
       - key: SYNC_SECONDS
         value: "60"
-
       - key: SAMPLE_SECONDS
         value: "60"
-
       - key: CHECK_CONCURRENCY
         value: "2"
