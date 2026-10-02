@@ -1,30 +1,25 @@
-# PatriaStreamBot TikTok Bridge — Northflank
+# PatriaStreamBot TikTok Bridge — Render Free
 
-Servicio Node.js persistente para detectar TikTok LIVE y enviar eventos al Worker de PatriaStreamBot.
+Web Service Node.js para detectar TikTok LIVE y enviar eventos al Worker de PatriaStreamBot.
 
-## Variables de entorno obligatorias
+## Despliegue recomendado
+
+1. Sube el contenido de esta carpeta a la raíz de tu repositorio GitHub `PatriaStreamBot-TikTok`.
+2. En Render crea un **Blueprint** desde ese repositorio (Render leerá `render.yaml`).
+3. Cuando Render pida `TIKTOK_BRIDGE_TOKEN`, pega el token generado por `PREPARAR-TOKEN-RENDER.bat`.
+4. El plan definido es `free` y el health check es `/health`.
+
+El Worker de Cloudflare recibe el `RENDER_EXTERNAL_HOSTNAME` por heartbeat y comprueba periódicamente `/health`. El bridge mantiene la detección TikTok mientras el servicio está activo.
+
+## Variables
 
 - `PATRIABOT_URL=https://patria-stream-bot.disetoal.workers.dev`
 - `TIKTOK_BRIDGE_TOKEN=<mismo token guardado en Cloudflare>`
-
-## Variables recomendadas
-
-- `DEPLOYMENT_LABEL=northflank`
-- `HOST_LABEL=Northflank`
-- `POLL_SECONDS=30`
+- `DEPLOYMENT_LABEL=render`
+- `HOST_LABEL=Render`
+- `POLL_SECONDS=60`
 - `SYNC_SECONDS=60`
-- `SAMPLE_SECONDS=30`
-- `CHECK_CONCURRENCY=5`
-- `PORT=8788`
+- `SAMPLE_SECONDS=60`
+- `CHECK_CONCURRENCY=2`
 
-## Northflank
-
-1. Crea un proyecto en Developer Sandbox.
-2. Crea un **Combined Service** desde un repositorio GitHub/GitLab/Bitbucket que contenga esta carpeta.
-3. Build type: **Dockerfile**.
-4. Si el repo contiene más carpetas, usa esta carpeta como build context y `northflank-tiktok/Dockerfile` como Dockerfile.
-5. Añade las variables anteriores en Runtime Environment.
-6. Usa 1 instancia y el plan gratuito disponible en tu Sandbox.
-7. No necesitas un puerto público. El proceso solo realiza conexiones salientes a TikTok y Cloudflare.
-
-El contenedor expone `/health` en el puerto 8788 para comprobaciones internas.
+Render define automáticamente `PORT` y `RENDER_EXTERNAL_HOSTNAME`.

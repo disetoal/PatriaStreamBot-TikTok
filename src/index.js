@@ -6,16 +6,17 @@ import { TikTokLiveConnection, WebcastEvent, ControlEvent } from "tiktok-live-co
 
 loadDotEnv();
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const BASE_URL = String(process.env.PATRIABOT_URL || "").replace(/\/+$/, "");
 const TOKEN = String(process.env.TIKTOK_BRIDGE_TOKEN || "");
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS || 60), 30, 600);
 const SYNC_SECONDS = clamp(Number(process.env.SYNC_SECONDS || 60), 30, 600);
 const SAMPLE_SECONDS = clamp(Number(process.env.SAMPLE_SECONDS || 30), 15, 300);
 const PORT = clamp(Number(process.env.PORT || 8788), 1, 65535);
-const HOST_LABEL = String(process.env.HOST_LABEL || process.env.NF_SERVICE_ID || "northflank" || os.hostname()).slice(0, 120);
-const DEPLOYMENT_LABEL = String(process.env.DEPLOYMENT_LABEL || "northflank").slice(0, 40);
+const HOST_LABEL = String(process.env.HOST_LABEL || process.env.RENDER_SERVICE_NAME || process.env.RENDER_INSTANCE_ID || os.hostname()).slice(0, 120);
+const DEPLOYMENT_LABEL = String(process.env.DEPLOYMENT_LABEL || "render").slice(0, 40);
 const CHECK_CONCURRENCY = clamp(Number(process.env.CHECK_CONCURRENCY || 5), 1, 20);
+const PUBLIC_URL = process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : null;
 
 if (!BASE_URL || !/^https?:\/\//i.test(BASE_URL)) fatal("Falta PATRIABOT_URL en .env");
 if (!TOKEN) fatal("Falta TIKTOK_BRIDGE_TOKEN en .env");
@@ -269,6 +270,7 @@ async function sendHeartbeat() {
         checkConcurrency: CHECK_CONCURRENCY,
         errors: recentErrors,
         host: HOST_LABEL,
+        publicUrl: PUBLIC_URL,
         uptimeSeconds: Math.round(process.uptime()),
         rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         heapMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
