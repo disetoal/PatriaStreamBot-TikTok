@@ -8,12 +8,16 @@ import {
   Events,
   GatewayIntentBits,
   Partials,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder
 } from "discord.js";
 
 loadDotEnv();
 
-const VERSION = "0.9.2";
+const VERSION = "1.0.1";
 const BASE_URL = String(process.env.PATRIABOT_URL || "").replace(/\/+$/, "");
 const TOKEN = String(process.env.TIKTOK_BRIDGE_TOKEN || "");
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS || 60), 30, 600);
@@ -34,10 +38,13 @@ const recentErrors = [];
 let lastSyncAt = 0;
 let shuttingDown = false;
 let loopRunning = false;
+let snapshotReady = false;
 let discordClient = null;
-let discordConfig = { purchaseChannelId: "", approvalEmoji: "✅", approvalMode: "any", allowedRoleIds: [] };
+let discordConfig = { purchaseChannelId: "", announcementChannelId: "", supportChannelIds: [], approvalEmoji: "✅", approvalMode: "any", allowedRoleIds: [], assistantEnabled: true, assistantPrefix: "!patria", staffRoleIds: [] };
+const pendingStaffDrafts = new Map();
 let discordLastEventAt = null;
 let discordConfigAt = 0;
+let discordChannelHealth = { purchaseChannelReady:false, announcementChannelReady:false, supportChannelsReady:0, supportChannelsExpected:0 };
 const discordErrors = [];
 
 
@@ -112,7 +119,9 @@ function createMonitor(username, streamer) {
     consecutiveOffline: 0,
     lastTitle: null,
     lastStartedAt: null,
-    lastThumbnail: null
+    lastThumbnail: null,
+    lastPositiveAt: 0,
+    lastRoomUserAt: 0
   };
 }
 
@@ -125,17 +134,45 @@ async function checkMonitor(monitor) {
   // (status 4), so a room id/title alone must never be treated as proof of LIVE.
   if (monitor.connection && monitor.live) {
     if (Date.now() - monitor.lastSampleAt > SAMPLE_SECONDS * 1000) {
+      let positive = false;
       try {
+        // Revalidación estricta mientras ya está marcado LIVE. TikTok puede dejar
+        // el websocket o roomInfo viejo abierto después de finalizar el directo.
+        const htmlState = await fetchHtmlLiveState(monitor.connection, monitor.username);
+        if (htmlState.known && !htmlState.live) {
+          await markOffline(monitor, `HTML confirma OFFLINE${htmlState.status !== null ? ` (status ${htmlState.status})` : ""}`);
+          return;
+        }
+        if (htmlState.known && htmlState.live) {
+          positive = true;
+          monitor.lastPositiveAt = Date.now();
+          if (htmlState.roomId) monitor.roomId = String(htmlState.roomId);
+        }
+
         const info = await monitor.connection.fetchRoomInfo(monitor.roomId || undefined);
         const status = extractRoomStatus(info);
         if (status !== null && status !== 2) {
           await markOffline(monitor, `room status ${status} (2 = LIVE)`);
           return;
         }
+        if (status === 2) {
+          positive = true;
+          monitor.lastPositiveAt = Date.now();
+        }
         applyRoomMeta(monitor, info);
+
+        // Si durante varios minutos no existe ninguna prueba positiva nueva
+        // (status 2, HTML LIVE o ROOM_USER), cerramos la sesión antes de dejar
+        // un falso LIVE eterno en la web.
+        const freshestPositive = Math.max(monitor.lastPositiveAt || 0, monitor.lastRoomUserAt || 0);
+        if (!positive && freshestPositive && Date.now() - freshestPositive > 180000) {
+          await markOffline(monitor, "sin confirmación LIVE fresca durante 3 minutos");
+          return;
+        }
+
         await sendLiveSample(monitor, "sample");
       } catch (error) {
-        rememberError(`@${monitor.username}: no se pudo refrescar roomInfo: ${error?.message || error}`);
+        rememberError(`@${monitor.username}: no se pudo refrescar LIVE: ${error?.message || error}`);
       }
     }
     return;
@@ -261,6 +298,7 @@ function applyRoomMeta(monitor, info) {
 async function confirmLive(monitor, reason) {
   if (monitor.live) return;
   monitor.live = true;
+  monitor.lastPositiveAt = Date.now();
   monitor.offlineReported = false;
   await sendLiveSample(monitor, "live");
   log(`🔴 @${monitor.username} LIVE · room ${monitor.roomId || "?"} · ${reason}`);
@@ -270,6 +308,8 @@ function attachConnectionEvents(monitor, connection) {
   connection.on(WebcastEvent.ROOM_USER, (data) => {
     const viewers = safeInt(data?.viewerCount ?? data?.userCount ?? data?.memberCount, 0);
     monitor.lastViewerCount = viewers;
+    monitor.lastRoomUserAt = Date.now();
+    monitor.lastPositiveAt = Date.now();
     if (!monitor.live) {
       confirmLive(monitor, "ROOM_USER recibido").catch((e) => rememberError(`@${monitor.username}: confirmación: ${e?.message || e}`));
       return;
@@ -305,7 +345,8 @@ async function sendLiveSample(monitor, type) {
     startedAt: monitor.lastStartedAt || new Date().toISOString(),
     thumbnail: monitor.lastThumbnail || null
   };
-  await sendEvent(payload);
+  const result = await sendEvent(payload);
+  if (type === "live") log(`🌐 @${monitor.username} sincronizado con la página · sesión ${result?.sessionId || "?"}`);
   monitor.lastSampleAt = Date.now();
 }
 
@@ -324,6 +365,8 @@ async function markOffline(monitor, reason) {
   monitor.lastTitle = null;
   monitor.lastStartedAt = null;
   monitor.lastThumbnail = null;
+  monitor.lastPositiveAt = 0;
+  monitor.lastRoomUserAt = 0;
   const connection = monitor.connection;
   monitor.connection = null;
   if (connection) {
@@ -344,6 +387,17 @@ async function sendEvent(event) {
   return api("/api/internal/tiktok/event", { method: "POST", body: JSON.stringify(event) });
 }
 
+function activeStreamSnapshot(values = [...monitors.values()]) {
+  return values.filter((m) => m.live).map((m) => ({
+    username: m.username,
+    roomId: m.roomId || null,
+    viewers: safeInt(m.lastViewerCount, 0),
+    title: m.lastTitle || `@${m.username} está en directo`,
+    startedAt: m.lastStartedAt || null,
+    thumbnail: m.lastThumbnail || null
+  }));
+}
+
 async function sendHeartbeat() {
   const values = [...monitors.values()];
   const live = values.filter((m) => m.live).length;
@@ -357,6 +411,8 @@ async function sendHeartbeat() {
         monitored: values.length,
         live,
         activeConnections,
+        snapshotReady,
+        activeStreams: activeStreamSnapshot(values),
         pollSeconds: POLL_SECONDS,
         checkConcurrency: CHECK_CONCURRENCY,
         errors: recentErrors,
@@ -384,6 +440,7 @@ async function cycle() {
     for (let i = 0; i < list.length; i += CHECK_CONCURRENCY) {
       await Promise.all(list.slice(i, i + CHECK_CONCURRENCY).map(checkMonitor));
     }
+    snapshotReady = true;
     await sendHeartbeat();
   } catch (error) {
     rememberError(`ciclo: ${error?.message || error}`);
@@ -506,9 +563,14 @@ async function syncDiscordConfig(force = false) {
     const data = await api("/api/internal/discord/config");
     discordConfig = {
       purchaseChannelId: String(data.purchaseChannelId || ""),
+      announcementChannelId: String(data.announcementChannelId || ""),
+      supportChannelIds: Array.isArray(data.supportChannelIds) ? data.supportChannelIds.map(String) : [],
       approvalEmoji: String(data.approvalEmoji || "✅"),
       approvalMode: data.approvalMode === "admin" ? "admin" : "any",
-      allowedRoleIds: Array.isArray(data.allowedRoleIds) ? data.allowedRoleIds.map(String) : []
+      allowedRoleIds: Array.isArray(data.allowedRoleIds) ? data.allowedRoleIds.map(String) : [],
+      assistantEnabled: data.assistantEnabled !== false,
+      assistantPrefix: String(data.assistantPrefix || "!patria"),
+      staffRoleIds: Array.isArray(data.staffRoleIds) ? data.staffRoleIds.map(String) : []
     };
     discordConfigAt = Date.now();
   } catch (error) {
@@ -599,12 +661,25 @@ async function postPurchaseApproval(message, reaction, user, purchase) {
 async function sendDiscordHeartbeat() {
   if (!discordClient) return;
   let purchaseChannelReady = false;
+  let announcementChannelReady = false;
+  let supportChannelsReady = 0;
   try {
     await syncDiscordConfig();
     if (discordClient.isReady() && discordConfig.purchaseChannelId) {
       const channel = await discordClient.channels.fetch(discordConfig.purchaseChannelId).catch(() => null);
       purchaseChannelReady = !!channel;
     }
+    if (discordClient.isReady() && discordConfig.announcementChannelId) {
+      const channel = await discordClient.channels.fetch(discordConfig.announcementChannelId).catch(() => null);
+      announcementChannelReady = !!channel;
+    }
+    if (discordClient.isReady()) {
+      for (const id of discordConfig.supportChannelIds || []) {
+        const channel = await discordClient.channels.fetch(id).catch(() => null);
+        if (channel) supportChannelsReady++;
+      }
+    }
+    discordChannelHealth={purchaseChannelReady,announcementChannelReady,supportChannelsReady,supportChannelsExpected:(discordConfig.supportChannelIds||[]).length};
     await api("/api/internal/discord/heartbeat", {
       method: "POST",
       body: JSON.stringify({
@@ -612,6 +687,9 @@ async function sendDiscordHeartbeat() {
         user: discordClient.user ? `${discordClient.user.username}#${discordClient.user.discriminator}` : null,
         guilds: discordClient.guilds?.cache?.size || 0,
         purchaseChannelReady,
+        announcementChannelReady,
+        supportChannelsReady,
+        supportChannelsExpected: (discordConfig.supportChannelIds || []).length,
         lastEventAt: discordLastEventAt,
         errors: discordErrors
       })
@@ -619,6 +697,145 @@ async function sendDiscordHeartbeat() {
   } catch (error) {
     rememberDiscordError(`heartbeat: ${error?.message || error}`);
   }
+}
+
+
+async function memberIsStaff(messageOrInteraction, userId) {
+  await syncDiscordConfig();
+  const guild = messageOrInteraction.guild;
+  if (!guild) return false;
+  try {
+    const member = await guild.members.fetch(userId);
+    if (member.permissions.has(PermissionFlagsBits.Administrator) || member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
+    return discordConfig.staffRoleIds.some((id) => member.roles.cache.has(id));
+  } catch { return false; }
+}
+
+function cleanAssistantCommand(message) {
+  let text = String(message.content || "").trim();
+  if (discordClient?.user) text = text.replace(new RegExp(`<@!?${discordClient.user.id}>`, "g"), "").trim();
+  const prefix = String(discordConfig.assistantPrefix || "!patria");
+  if (text.toLowerCase().startsWith(prefix.toLowerCase())) text = text.slice(prefix.length).trim();
+  return text;
+}
+
+async function handleAssistantMessage(message) {
+  if (message.author?.bot || !message.guild || !discordClient?.isReady()) return;
+  await syncDiscordConfig();
+  if (!discordConfig.assistantEnabled) return;
+  const prefix = String(discordConfig.assistantPrefix || "!patria");
+  const mentioned = message.mentions?.users?.has(discordClient.user.id);
+  const prefixed = String(message.content || "").trim().toLowerCase().startsWith(prefix.toLowerCase());
+  if (!mentioned && !prefixed) return;
+
+  const command = cleanAssistantCommand(message);
+  const lower = command.toLowerCase();
+  const isStaffCommand = lower.startsWith("anuncio ") || lower.startsWith("evento ");
+  const inSupport = (discordConfig.supportChannelIds || []).includes(String(message.channelId));
+
+  if (isStaffCommand) {
+    if (!(await memberIsStaff(message, message.author.id))) return void message.reply("🔒 Ese comando es solo para staff autorizado.");
+    const kind = lower.startsWith("evento ") ? "evento" : "anuncio";
+    const text = command.slice(kind.length).trim().slice(0, 3500);
+    if (!text) return void message.reply("Falta el contenido del borrador.");
+    const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2,7)}`;
+    pendingStaffDrafts.set(id, { userId: message.author.id, channelId: message.channelId, guildId: message.guildId, kind, text, createdAt: Date.now() });
+    const destination = discordConfig.announcementChannelId ? `<#${discordConfig.announcementChannelId}>` : "el canal actual";
+    const embed = new EmbedBuilder().setColor(kind === "evento" ? 0x007934 : 0xF9E300)
+      .setTitle(kind === "evento" ? "🏆 Vista previa de evento" : "📢 Vista previa de anuncio")
+      .setDescription(text)
+      .addFields({name:"Destino",value:destination,inline:false})
+      .setFooter({ text: "Mi Patria Craft · Requiere confirmación" }).setTimestamp();
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`patria_confirm_${id}`).setLabel("Publicar").setStyle(ButtonStyle.Success).setEmoji("✅"),
+      new ButtonBuilder().setCustomId(`patria_cancel_${id}`).setLabel("Cancelar").setStyle(ButtonStyle.Secondary).setEmoji("✖️")
+    );
+    return void message.reply({ embeds:[embed], components:[row] });
+  }
+
+  if (!inSupport) {
+    if (mentioned || prefixed) {
+      const channels=(discordConfig.supportChannelIds||[]).map(id=>`<#${id}>`).join(" o ");
+      return void message.reply(`🛟 El Asistente Patria atiende soporte en ${channels || "los canales oficiales de soporte"}.`);
+    }
+    return;
+  }
+
+  if (!command) return void message.reply(`🇧🇴 Hola. Pregúntame sobre Mi Patria Craft. Si necesitas abrir un caso usa \`${prefix} ticket <tu problema>\`.`);
+
+  if (lower.startsWith("ticket ")) {
+    const description=command.slice("ticket".length).trim().slice(0,3500);
+    if(!description)return void message.reply(`Usa \`${prefix} ticket <describe tu problema>\`.`);
+    try {
+      const r=await api("/api/internal/discord/support-ticket",{method:"POST",body:JSON.stringify({
+        channelId:message.channelId,guildId:message.guildId,messageId:message.id,
+        userId:message.author.id,username:message.author.globalName||message.author.username,
+        subject:`Soporte Discord · ${message.author.globalName||message.author.username}`,description
+      })});
+      discordLastEventAt=new Date().toISOString();
+      return void message.reply(`🎫 **Ticket #${r.ticketId} creado.** El staff ya puede verlo en PatriaNetwork.`);
+    } catch(error){rememberDiscordError(`ticket: ${error?.message||error}`);return void message.reply("No pude crear el ticket. Avisa a un miembro del staff.");}
+  }
+
+  try {
+    const r = await api("/api/internal/discord/assistant", { method:"POST", body:JSON.stringify({ text: command, userId: message.author.id, username: message.author.username, channelId: message.channelId }) });
+    await message.reply({ content: `🇧🇴 **Asistente Patria**\n${String(r.answer || "No encontré respuesta.").slice(0,1900)}\n\nSi necesitas seguimiento usa \`${prefix} ticket <tu problema>\`.`, allowedMentions:{ repliedUser:false } });
+    discordLastEventAt = new Date().toISOString();
+  } catch (error) { rememberDiscordError(`asistente: ${error?.message || error}`); }
+}
+
+async function handleStaffDraftInteraction(interaction) {
+  if (!interaction.isButton()) return;
+  const m = interaction.customId.match(/^patria_(confirm|cancel)_([a-z0-9]+)$/i); if (!m) return;
+  const draft = pendingStaffDrafts.get(m[2]);
+  if (!draft) return void interaction.reply({ content:"Este borrador expiró.", ephemeral:true });
+  if (draft.userId !== interaction.user.id || !(await memberIsStaff(interaction, interaction.user.id))) return void interaction.reply({ content:"No puedes confirmar este borrador.", ephemeral:true });
+  pendingStaffDrafts.delete(m[2]);
+  if (m[1] === "cancel") return void interaction.update({ content:"Borrador cancelado.", embeds:[], components:[] });
+
+  await syncDiscordConfig(true);
+  const targetId=discordConfig.announcementChannelId || draft.channelId;
+  const target=await discordClient.channels.fetch(targetId).catch(()=>null);
+  if(!target || !target.isTextBased()) return void interaction.reply({content:"No puedo acceder al canal oficial de anuncios.",ephemeral:true});
+
+  const isEvent=draft.kind==="evento";
+  const embed = new EmbedBuilder().setColor(isEvent?0x007934:0xF9E300)
+    .setTitle(isEvent?"🏆 EVENTO · MI PATRIA CRAFT":"🇧🇴 COMUNICADO · MI PATRIA CRAFT")
+    .setDescription(draft.text)
+    .setFooter({text:"Mi Patria Craft • Staff oficial"}).setTimestamp();
+  await target.send({embeds:[embed]});
+  await interaction.update({ content:`✅ Publicado en <#${targetId}> por ${interaction.user}.`, embeds:[], components:[] });
+  discordLastEventAt=new Date().toISOString();
+  await api("/api/internal/discord/staff-action", { method:"POST", body:JSON.stringify({ action:isEvent?"event.publish":"announcement.publish",actor:interaction.user.globalName||interaction.user.username,summary:draft.text.slice(0,500),messageId:interaction.message.id }) }).catch(()=>{});
+}
+
+async function pollDiscordOutbox() {
+  if (!discordClient?.isReady()) return;
+  try {
+    await syncDiscordConfig();
+    const r=await api("/api/internal/discord/outbox");
+    for(const item of r.items||[]){
+      try{
+        const channel=await discordClient.channels.fetch(String(item.targetChannelId||discordConfig.announcementChannelId||"")).catch(()=>null);
+        if(!channel || !channel.isTextBased())throw new Error("canal_destino_no_disponible");
+        const p=item.payload||{};
+        const embed=new EmbedBuilder()
+          .setColor(Number(p.color||0xF9E300))
+          .setTitle(String(p.title||item.title||"🇧🇴 MI PATRIA CRAFT").slice(0,256))
+          .setDescription(String(p.body||item.body||"").slice(0,4000))
+          .setFooter({text:String(p.footer||"Mi Patria Craft • Comunicado oficial").slice(0,2048)})
+          .setTimestamp();
+        if(p.thumbnail){try{embed.setThumbnail(String(p.thumbnail))}catch{}}
+        await channel.send({embeds:[embed]});
+        await api("/api/internal/discord/outbox/ack",{method:"POST",body:JSON.stringify({id:item.id,ok:true})});
+        discordLastEventAt=new Date().toISOString();
+        log(`📢 Outbox #${item.id} publicado en ${channel.id}`);
+      }catch(error){
+        await api("/api/internal/discord/outbox/ack",{method:"POST",body:JSON.stringify({id:item.id,ok:false,error:String(error?.message||error)})}).catch(()=>{});
+        rememberDiscordError(`outbox #${item.id}: ${error?.message||error}`);
+      }
+    }
+  }catch(error){rememberDiscordError(`outbox: ${error?.message||error}`);}
 }
 
 async function startDiscordBot() {
@@ -641,6 +858,7 @@ async function startDiscordBot() {
     log(`🤖 Discord conectado como ${client.user.tag}`);
     await syncDiscordConfig(true);
     await sendDiscordHeartbeat();
+    await pollDiscordOutbox();
   });
 
   discordClient.on(Events.MessageReactionAdd, async (reaction, user) => {
@@ -662,6 +880,9 @@ async function startDiscordBot() {
     }
   });
 
+  discordClient.on(Events.MessageCreate, handleAssistantMessage);
+  discordClient.on(Events.InteractionCreate, handleStaffDraftInteraction);
+
   discordClient.on("error", (error) => rememberDiscordError(error?.message || error));
   try {
     await discordClient.login(DISCORD_BOT_TOKEN);
@@ -681,6 +902,8 @@ const server = http.createServer((req, res) => {
       monitored: values.length,
       live: values.filter((m) => m.live).length,
       activeConnections: values.filter((m) => m.connection && m.live).length,
+      snapshotReady,
+      activeStreams: activeStreamSnapshot(values),
       host: HOST_LABEL,
       deployment: DEPLOYMENT_LABEL,
       uptimeSeconds: Math.round(process.uptime()),
@@ -694,6 +917,11 @@ const server = http.createServer((req, res) => {
         user: discordClient?.user?.tag || null,
         guilds: discordClient?.guilds?.cache?.size || 0,
         purchaseChannelId: discordConfig.purchaseChannelId || null,
+        announcementChannelId: discordConfig.announcementChannelId || null,
+        announcementChannelReady: discordChannelHealth.announcementChannelReady,
+        supportChannelIds: discordConfig.supportChannelIds || [],
+        supportChannelsExpected: discordChannelHealth.supportChannelsExpected,
+        supportChannelsReady: discordChannelHealth.supportChannelsReady,
         lastEventAt: discordLastEventAt,
         errors: discordErrors
       }
@@ -708,11 +936,11 @@ server.listen(PORT, "0.0.0.0", () => log(`PatriaStreamBot Bridge v${VERSION} esc
 
 await startDiscordBot();
 await syncStreamers(true).catch((e) => rememberError(`sync inicial: ${e?.message || e}`));
-await sendHeartbeat();
 await cycle();
 const cycleTimer = setInterval(cycle, POLL_SECONDS * 1000);
 const heartbeatTimer = setInterval(sendHeartbeat, 30000);
 const discordHeartbeatTimer = setInterval(sendDiscordHeartbeat, 30000);
+const discordOutboxTimer = setInterval(pollDiscordOutbox, 10000);
 
 async function shutdown(signal) {
   if (shuttingDown) return;
@@ -721,6 +949,7 @@ async function shutdown(signal) {
   clearInterval(cycleTimer);
   clearInterval(heartbeatTimer);
   clearInterval(discordHeartbeatTimer);
+  clearInterval(discordOutboxTimer);
   await Promise.all([...monitors.values()].map(disconnectMonitor));
   if (discordClient) {
     try { discordClient.destroy(); } catch {}
