@@ -17,7 +17,7 @@ import {
 
 loadDotEnv();
 
-const VERSION = "1.0.2";
+const VERSION = "1.0.3";
 const BASE_URL = String(process.env.PATRIABOT_URL || "").replace(/\/+$/, "");
 const TOKEN = String(process.env.TIKTOK_BRIDGE_TOKEN || "");
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS || 60), 30, 600);
@@ -45,6 +45,7 @@ const pendingStaffDrafts = new Map();
 let discordLastEventAt = null;
 let discordConfigAt = 0;
 let discordChannelHealth = { purchaseChannelReady:false, announcementChannelReady:false, supportChannelsReady:0, supportChannelsExpected:0 };
+let discordChannelIssues = [];
 const discordErrors = [];
 
 
@@ -55,6 +56,12 @@ function rememberError(message) {
   recentErrors.push(text);
   while (recentErrors.length > 5) recentErrors.shift();
   warn(text);
+}
+
+function clearRecentErrors(prefix) {
+  for (let i = recentErrors.length - 1; i >= 0; i--) {
+    if (String(recentErrors[i] || "").startsWith(prefix)) recentErrors.splice(i, 1);
+  }
 }
 
 async function api(path, options = {}) {
@@ -426,6 +433,7 @@ async function sendHeartbeat() {
         node: process.version
       })
     });
+    clearRecentErrors("heartbeat:");
   } catch (error) {
     rememberError(`heartbeat: ${error?.message || error}`);
   }
@@ -555,6 +563,12 @@ function rememberDiscordError(message) {
   discordErrors.push(text);
   while (discordErrors.length > 5) discordErrors.shift();
   warn(`Discord: ${text}`);
+}
+
+function clearDiscordErrors(prefix) {
+  for (let i = discordErrors.length - 1; i >= 0; i--) {
+    if (String(discordErrors[i] || "").startsWith(prefix)) discordErrors.splice(i, 1);
+  }
 }
 
 async function syncDiscordConfig(force = false) {
@@ -699,6 +713,7 @@ async function sendDiscordHeartbeat() {
       }
     }
     discordChannelHealth={purchaseChannelReady,announcementChannelReady,supportChannelsReady,supportChannelsExpected:(discordConfig.supportChannelIds||[]).length};
+    discordChannelIssues = [...channelIssues].slice(-5);
     await api("/api/internal/discord/heartbeat", {
       method: "POST",
       body: JSON.stringify({
@@ -713,6 +728,7 @@ async function sendDiscordHeartbeat() {
         errors: [...discordErrors, ...channelIssues].slice(-5)
       })
     });
+    clearDiscordErrors("heartbeat:");
   } catch (error) {
     rememberDiscordError(`heartbeat: ${error?.message || error}`);
   }
@@ -942,7 +958,7 @@ const server = http.createServer((req, res) => {
         supportChannelsExpected: discordChannelHealth.supportChannelsExpected,
         supportChannelsReady: discordChannelHealth.supportChannelsReady,
         lastEventAt: discordLastEventAt,
-        errors: discordErrors
+        errors: [...discordErrors, ...discordChannelIssues].slice(-5)
       }
     }));
     return;
