@@ -17,7 +17,7 @@ import {
 
 loadDotEnv();
 
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const BASE_URL = String(process.env.PATRIABOT_URL || "").replace(/\/+$/, "");
 const TOKEN = String(process.env.TIKTOK_BRIDGE_TOKEN || "");
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS || 60), 30, 600);
@@ -72,7 +72,7 @@ async function api(path, options = {}) {
     });
     let body = null;
     try { body = await response.json(); } catch {}
-    if (!response.ok) throw new Error(`${path} HTTP ${response.status}: ${body?.error || body?.message || response.statusText}`);
+    if (!response.ok) throw new Error(`${path} HTTP ${response.status}: ${body?.message || body?.error || response.statusText}`);
     return body || {};
   } finally {
     clearTimeout(timeout);
@@ -663,20 +663,39 @@ async function sendDiscordHeartbeat() {
   let purchaseChannelReady = false;
   let announcementChannelReady = false;
   let supportChannelsReady = 0;
+  const channelIssues = [];
+  const inspectChannel = async (id, label) => {
+    if (!id) { channelIssues.push(`${label}: ID no configurado`); return false; }
+    try {
+      const channel = await discordClient.channels.fetch(String(id));
+      if (!channel) { channelIssues.push(`${label} ${id}: no encontrado`); return false; }
+      if (typeof channel.isTextBased === "function" && !channel.isTextBased()) {
+        channelIssues.push(`${label} ${id}: no es un canal de texto`);
+        return false;
+      }
+      const me = channel.guild?.members?.me || null;
+      const perms = me && typeof channel.permissionsFor === "function" ? channel.permissionsFor(me) : null;
+      if (perms && !perms.has(PermissionFlagsBits.ViewChannel)) {
+        channelIssues.push(`${label} ${id}: falta View Channel`);
+        return false;
+      }
+      if (perms && !perms.has(PermissionFlagsBits.SendMessages)) {
+        channelIssues.push(`${label} ${id}: falta Send Messages`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      channelIssues.push(`${label} ${id}: ${String(error?.message || error).slice(0,120)}`);
+      return false;
+    }
+  };
   try {
     await syncDiscordConfig();
-    if (discordClient.isReady() && discordConfig.purchaseChannelId) {
-      const channel = await discordClient.channels.fetch(discordConfig.purchaseChannelId).catch(() => null);
-      purchaseChannelReady = !!channel;
-    }
-    if (discordClient.isReady() && discordConfig.announcementChannelId) {
-      const channel = await discordClient.channels.fetch(discordConfig.announcementChannelId).catch(() => null);
-      announcementChannelReady = !!channel;
-    }
     if (discordClient.isReady()) {
+      purchaseChannelReady = await inspectChannel(discordConfig.purchaseChannelId, "Compras");
+      announcementChannelReady = await inspectChannel(discordConfig.announcementChannelId, "Anuncios");
       for (const id of discordConfig.supportChannelIds || []) {
-        const channel = await discordClient.channels.fetch(id).catch(() => null);
-        if (channel) supportChannelsReady++;
+        if (await inspectChannel(id, "Soporte")) supportChannelsReady++;
       }
     }
     discordChannelHealth={purchaseChannelReady,announcementChannelReady,supportChannelsReady,supportChannelsExpected:(discordConfig.supportChannelIds||[]).length};
@@ -691,7 +710,7 @@ async function sendDiscordHeartbeat() {
         supportChannelsReady,
         supportChannelsExpected: (discordConfig.supportChannelIds || []).length,
         lastEventAt: discordLastEventAt,
-        errors: discordErrors
+        errors: [...discordErrors, ...channelIssues].slice(-5)
       })
     });
   } catch (error) {
